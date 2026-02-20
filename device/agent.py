@@ -1,132 +1,221 @@
-# device/agent.py
-"""
-Raspberry Pi device agent.
-
-Records audio via microphone (or reads a .wav file),
-sends it to the Companion API, polls for the result,
-and plays back the TTS response.
-
-Usage:
-  python device/agent.py                  # record from mic
-  python device/agent.py path/to/file.wav # send existing file
-"""
+# device/wake_agent.py
 from __future__ import annotations
 
-import io
 import os
-import sys
 import time
+import uuid
+import wave
 import tempfile
+from pathlib import Path
 
 import requests
+import webrtcvad
+import pyaudio
+
+from openwakeword.model import Model
 
 API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "dev-device-token-001")
-RECORD_SECONDS = 5
+HEADERS_BASE = {"X-Device-Token": DEVICE_TOKEN}
+
 SAMPLE_RATE = 16000
-POLL_INTERVAL = 1.0
-MAX_POLLS = 60
+CHANNELS = 1
+FRAME_MS = 20
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
+FRAME_BYTES = FRAME_SAMPLES * 2  # int16
 
-HEADERS = {"X-Device-Token": DEVICE_TOKEN}
+POLL_INTERVAL = 0.6
+MAX_POLLS = 80
+HTTP_TIMEOUT = 10
+
+ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "device/assets"))
+BEEP_WAV = ASSETS_DIR / "beep.wav"
+THINKING_WAV = ASSETS_DIR / "thinking.wav"
+FALLBACK_WAV = ASSETS_DIR / "fallback.wav"
+
+# Wake words you care about.
+# Start with names, not generic "hey".
+WAKE_NAMES = ["Pal"]
+
+# VAD tuning
+VAD_AGGRESSIVENESS = 2  # 0-3
+MAX_RECORD_SECONDS = 6
+SILENCE_STOP_MS = 700
 
 
-def record_audio(duration: int = RECORD_SECONDS, sr: int = SAMPLE_RATE) -> str:
-    """Record audio from the default microphone and save to a temp .wav file."""
+def req(method: str, url: str, **kwargs) -> requests.Response:
+    return requests.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+
+
+def play_local_wav(path: Path) -> None:
+    if not path.exists():
+        return
     try:
         import sounddevice as sd
         import soundfile as sf
-    except ImportError:
-        print("Install sounddevice and soundfile: pip install sounddevice soundfile")
-        sys.exit(1)
-
-    print(f"🎙  Recording for {duration}s...")
-    audio = sd.rec(int(duration * sr), samplerate=sr, channels=1, dtype="int16")
-    sd.wait()
-    print("✅ Recording complete.")
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    sf.write(tmp.name, audio, sr)
-    return tmp.name
+        audio, sr = sf.read(str(path))
+        sd.play(audio, sr)
+        sd.wait()
+    except Exception:
+        return
 
 
-def upload_audio(audio_path: str) -> dict:
-    """Upload audio to the API and return the response."""
+def upload_audio(audio_path: str, trace_id: str) -> str:
     url = f"{API_BASE}/v1/voice-interactions"
+    headers = {**HEADERS_BASE, "X-Trace-Id": trace_id}
     with open(audio_path, "rb") as f:
-        resp = requests.post(url, headers=HEADERS, files={"audio": ("audio.wav", f, "audio/wav")})
+        resp = req("POST", url, headers=headers, files={"audio": ("audio.wav", f, "audio/wav")})
     resp.raise_for_status()
-    return resp.json()
+    return resp.json()["interaction_id"]
 
 
-def poll_result(interaction_id: str) -> dict:
-    """Poll the API until the interaction is complete or times out."""
-    url = f"{API_BASE}/v1/interactions/latest"
-    for i in range(MAX_POLLS):
-        resp = requests.get(url, headers=HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-        status = data.get("status", "unknown")
-        print(f"  ⏳ Status: {status} (poll {i+1}/{MAX_POLLS})")
-        if status == "complete":
-            return data
-        if status == "failed":
-            print("❌ Processing failed.")
-            return data
+def poll_interaction(interaction_id: str, trace_id: str) -> dict:
+    headers = {**HEADERS_BASE, "X-Trace-Id": trace_id}
+
+    by_id = f"{API_BASE}/v1/interactions/{interaction_id}"
+    latest = f"{API_BASE}/v1/interactions/latest"
+
+    for _ in range(MAX_POLLS):
+        r = req("GET", by_id, headers=headers)
+        if r.status_code == 404:
+            r = req("GET", latest, headers=headers)
+
+        if r.status_code < 400:
+            data = r.json()
+            if data.get("status") in {"complete", "failed"}:
+                return data
+
         time.sleep(POLL_INTERVAL)
-    print("⏰ Timed out waiting for result.")
+
     return {}
 
 
-def play_audio(interaction_id: str) -> None:
-    """Download and play the TTS audio response."""
+def fetch_audio(interaction_id: str, trace_id: str) -> bytes | None:
     url = f"{API_BASE}/v1/audio/{interaction_id}.wav"
-    resp = requests.get(url, headers=HEADERS)
-    if resp.status_code != 200:
-        print("⚠️  Audio not available.")
-        return
+    headers = {**HEADERS_BASE, "X-Trace-Id": trace_id}
+    r = req("GET", url, headers=headers)
+    if r.status_code == 200 and r.content:
+        return r.content
+    return None
 
+
+def play_wav_bytes(wav_bytes: bytes) -> bool:
     try:
         import sounddevice as sd
         import soundfile as sf
-
-        audio_data, sr = sf.read(io.BytesIO(resp.content))
-        print("🔊 Playing response...")
-        sd.play(audio_data, sr)
+        import io
+        audio, sr = sf.read(io.BytesIO(wav_bytes))
+        sd.play(audio, sr)
         sd.wait()
-    except ImportError:
-        # Fallback: save to file
-        out = "/tmp/companion_response.wav"
-        with open(out, "wb") as f:
-            f.write(resp.content)
-        print(f"🔊 Audio saved to {out}")
+        return True
+    except Exception:
+        return False
 
 
-def main():
-    # Determine audio source
-    if len(sys.argv) > 1:
-        audio_path = sys.argv[1]
-        print(f"📁 Using file: {audio_path}")
-    else:
-        audio_path = record_audio()
+def write_wav_file(frames: list[bytes]) -> str:
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"".join(frames))
+    return tmp.name
 
-    # Upload
-    print("📤 Uploading audio...")
-    result = upload_audio(audio_path)
-    interaction_id = result["interaction_id"]
-    print(f"📝 Interaction: {interaction_id}")
 
-    # Poll
-    print("⏳ Waiting for processing...")
-    detail = poll_result(interaction_id)
+def record_until_silence(stream: pyaudio.Stream) -> str:
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
-    if detail.get("status") == "complete":
-        print(f"\n👤 You said: {detail.get('transcript', '?')}")
-        print(f"🤖 {detail.get('assistant_reply', '...')}")
-        if detail.get("detected_emotion"):
-            print(f"💭 Emotion: {detail['detected_emotion']} ({detail.get('emotion_confidence', 0):.0%})")
+    frames: list[bytes] = []
+    silence_ms = 0
+    max_frames = int(MAX_RECORD_SECONDS * 1000 / FRAME_MS)
 
-        # Play TTS
-        play_audio(interaction_id)
+    for _ in range(max_frames):
+        frame = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
+        frames.append(frame)
+
+        is_speech = vad.is_speech(frame, SAMPLE_RATE)
+        if is_speech:
+            silence_ms = 0
+        else:
+            silence_ms += FRAME_MS
+            if silence_ms >= SILENCE_STOP_MS and len(frames) > int(0.5 * 1000 / FRAME_MS):
+                break
+
+    return write_wav_file(frames)
+
+
+def main() -> None:
+    # openWakeWord model, you can load custom wake word models later.
+    # For now, we’ll use built-in keyword spotting by scoring text-like labels.
+    model = Model()  # default pretrained
+
+    pa = pyaudio.PyAudio()
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=CHANNELS,
+        rate=SAMPLE_RATE,
+        input=True,
+        frames_per_buffer=FRAME_SAMPLES,
+    )
+
+    try:
+        while True:
+            # 1) Listen for wake word
+            frame = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
+
+            # openWakeWord expects numpy int16 frames
+            import numpy as np
+            audio_i16 = np.frombuffer(frame, dtype=np.int16)
+
+            preds = model.predict(audio_i16)
+
+            # preds is a dict of keyword->score depending on model config
+            # We'll do a simple heuristic: if any known name appears as a key and score high
+            triggered = False
+            triggered_key = None
+
+            for key, score in preds.items():
+                k = str(key).lower()
+                if any(name in k for name in WAKE_NAMES) and score >= 0.60:
+                    triggered = True
+                    triggered_key = k
+                    break
+
+            if not triggered:
+                continue
+
+            # 2) Wake detected
+            play_local_wav(BEEP_WAV)
+
+            # 3) Record until silence
+            audio_path = record_until_silence(stream)
+
+            # 4) Send to API
+            trace_id = uuid.uuid4().hex
+            try:
+                interaction_id = upload_audio(audio_path, trace_id)
+            except Exception:
+                play_local_wav(FALLBACK_WAV)
+                continue
+
+            play_local_wav(THINKING_WAV)
+
+            # 5) Wait, fetch, play
+            detail = poll_interaction(interaction_id, trace_id)
+            if not detail or detail.get("status") != "complete":
+                play_local_wav(FALLBACK_WAV)
+                continue
+
+            wav_bytes = fetch_audio(interaction_id, trace_id)
+            if wav_bytes and play_wav_bytes(wav_bytes):
+                continue
+
+            play_local_wav(FALLBACK_WAV)
+
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
 
 
 if __name__ == "__main__":

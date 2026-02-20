@@ -32,11 +32,11 @@ class BotProfile(Base, UUIDPrimaryKey, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), unique=True, nullable=False
     )
-    name: Mapped[str] = mapped_column(String(128), default="Buddy")
+    name: Mapped[str] = mapped_column(String(128), default="Pal")
     voice: Mapped[str] = mapped_column(String(64), default="nova")
     traits: Mapped[dict] = mapped_column(JSONB, default=DEFAULT_TRAITS)
     rules: Mapped[dict] = mapped_column(JSONB, default=DEFAULT_RULES)
     favorite_modes: Mapped[list] = mapped_column(JSONB, default=DEFAULT_MODES)
     active_mode: Mapped[str] = mapped_column(String(64), default="default")
-
+    wake_words: Mapped[list] = mapped_column(JSONB, default=["Pal"])
     user = relationship("User", back_populates="bot_profile")
