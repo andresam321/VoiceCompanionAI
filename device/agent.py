@@ -1,58 +1,70 @@
-# device/wake_agent.py
 from __future__ import annotations
 
+import io
 import os
+import struct
+import tempfile
 import time
 import uuid
 import wave
-import tempfile
 from pathlib import Path
+from typing import Optional
 
+import pvporcupine
+import pyaudio
 import requests
 import webrtcvad
-import pyaudio
 
-from openwakeword.model import Model
-
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/")
 DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "dev-device-token-001")
 HEADERS_BASE = {"X-Device-Token": DEVICE_TOKEN}
 
+# Porcupine
+PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY", "")
+PAL_KEYWORD_PATH = os.getenv("PAL_KEYWORD_PATH", "")  # e.g. device/keywords/pal.ppn
+FALLBACK_KEYWORD = os.getenv("FALLBACK_KEYWORD", "porcupine")  # built-in keyword
+
+# Audio
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_MS = 20
-FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
-FRAME_BYTES = FRAME_SAMPLES * 2  # int16
-
-POLL_INTERVAL = 0.6
-MAX_POLLS = 80
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 320 @ 16kHz
 HTTP_TIMEOUT = 10
 
-ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "device/assets"))
-BEEP_WAV = ASSETS_DIR / "beep.wav"
-THINKING_WAV = ASSETS_DIR / "thinking.wav"
-FALLBACK_WAV = ASSETS_DIR / "fallback.wav"
-
-# Wake words you care about.
-# Start with names, not generic "hey".
-WAKE_NAMES = ["Pal"]
+# Polling
+POLL_INTERVAL = 0.6
+MAX_POLLS = 80
 
 # VAD tuning
 VAD_AGGRESSIVENESS = 2  # 0-3
 MAX_RECORD_SECONDS = 6
 SILENCE_STOP_MS = 700
 
+# UI sounds (optional)
+ASSETS_DIR = Path(os.getenv("ASSETS_DIR", "device/assets"))
+BEEP_WAV = ASSETS_DIR / "beep.wav"
+THINKING_WAV = ASSETS_DIR / "thinking.wav"
+FALLBACK_WAV = ASSETS_DIR / "fallback.wav"
 
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 def req(method: str, url: str, **kwargs) -> requests.Response:
     return requests.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
 
 
 def play_local_wav(path: Path) -> None:
+    """Best-effort local wav playback (non-fatal if audio libs not installed)."""
     if not path.exists():
         return
     try:
         import sounddevice as sd
         import soundfile as sf
+
         audio, sr = sf.read(str(path))
         sd.play(audio, sr)
         sd.wait()
@@ -60,7 +72,57 @@ def play_local_wav(path: Path) -> None:
         return
 
 
+def play_wav_bytes(wav_bytes: bytes) -> bool:
+    """Play wav bytes. Returns True if played, False otherwise."""
+    try:
+        import sounddevice as sd
+        import soundfile as sf
+
+        audio, sr = sf.read(io.BytesIO(wav_bytes))
+        sd.play(audio, sr)
+        sd.wait()
+        return True
+    except Exception:
+        return False
+
+
+def write_wav_file(frames: list[bytes]) -> str:
+    """Write int16 PCM frames to a wav file and return path."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"".join(frames))
+    return tmp.name
+
+
+def record_until_silence(stream: pyaudio.Stream) -> str:
+    """Record after wake until silence (or max seconds)."""
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+
+    frames: list[bytes] = []
+    silence_ms = 0
+    max_frames = int(MAX_RECORD_SECONDS * 1000 / FRAME_MS)
+
+    for _ in range(max_frames):
+        frame = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
+        frames.append(frame)
+
+        is_speech = vad.is_speech(frame, SAMPLE_RATE)
+        if is_speech:
+            silence_ms = 0
+        else:
+            silence_ms += FRAME_MS
+            # require at least ~0.5s total before allowing early stop
+            if silence_ms >= SILENCE_STOP_MS and len(frames) > int(0.5 * 1000 / FRAME_MS):
+                break
+
+    return write_wav_file(frames)
+
+
 def upload_audio(audio_path: str, trace_id: str) -> str:
+    """POST wav to API. Returns interaction_id."""
     url = f"{API_BASE}/v1/voice-interactions"
     headers = {**HEADERS_BASE, "X-Trace-Id": trace_id}
     with open(audio_path, "rb") as f:
@@ -70,9 +132,10 @@ def upload_audio(audio_path: str, trace_id: str) -> str:
 
 
 def poll_interaction(interaction_id: str, trace_id: str) -> dict:
+    """Poll interaction by id until complete/failed."""
     headers = {**HEADERS_BASE, "X-Trace-Id": trace_id}
 
-    by_id = f"{API_BASE}/v1/interactions/{interaction_id}"
+    by_id = f"{API_BASE}/v1/voice-interactions/{interaction_id}"
     latest = f"{API_BASE}/v1/interactions/latest"
 
     for _ in range(MAX_POLLS):
@@ -90,7 +153,7 @@ def poll_interaction(interaction_id: str, trace_id: str) -> dict:
     return {}
 
 
-def fetch_audio(interaction_id: str, trace_id: str) -> bytes | None:
+def fetch_audio(interaction_id: str, trace_id: str) -> Optional[bytes]:
     url = f"{API_BASE}/v1/audio/{interaction_id}.wav"
     headers = {**HEADERS_BASE, "X-Trace-Id": trace_id}
     r = req("GET", url, headers=headers)
@@ -99,89 +162,56 @@ def fetch_audio(interaction_id: str, trace_id: str) -> bytes | None:
     return None
 
 
-def play_wav_bytes(wav_bytes: bytes) -> bool:
-    try:
-        import sounddevice as sd
-        import soundfile as sf
-        import io
-        audio, sr = sf.read(io.BytesIO(wav_bytes))
-        sd.play(audio, sr)
-        sd.wait()
-        return True
-    except Exception:
-        return False
+def build_porcupine() -> pvporcupine.Porcupine:
+    """
+    Prefer a custom 'pal' model if PAL_KEYWORD_PATH is provided.
+    Otherwise fall back to a built-in keyword (computer/jarvis/etc).
+    """
+    if not PICOVOICE_ACCESS_KEY:
+        raise RuntimeError("PICOVOICE_ACCESS_KEY is not set")
+
+    if PAL_KEYWORD_PATH:
+        keyword_path = Path(PAL_KEYWORD_PATH)
+        if not keyword_path.exists():
+            raise RuntimeError(f"PAL_KEYWORD_PATH not found: {PAL_KEYWORD_PATH}")
+
+        return pvporcupine.create(
+            access_key=PICOVOICE_ACCESS_KEY,
+            keyword_paths=[str(keyword_path)],
+            sensitivities=[0.6],
+        )
+
+    # fallback built-in keyword
+    return pvporcupine.create(
+        access_key=PICOVOICE_ACCESS_KEY,
+        keywords=[FALLBACK_KEYWORD],
+        sensitivities=[0.6],
+    )
 
 
-def write_wav_file(frames: list[bytes]) -> str:
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    with wave.open(tmp.name, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(b"".join(frames))
-    return tmp.name
-
-
-def record_until_silence(stream: pyaudio.Stream) -> str:
-    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-
-    frames: list[bytes] = []
-    silence_ms = 0
-    max_frames = int(MAX_RECORD_SECONDS * 1000 / FRAME_MS)
-
-    for _ in range(max_frames):
-        frame = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
-        frames.append(frame)
-
-        is_speech = vad.is_speech(frame, SAMPLE_RATE)
-        if is_speech:
-            silence_ms = 0
-        else:
-            silence_ms += FRAME_MS
-            if silence_ms >= SILENCE_STOP_MS and len(frames) > int(0.5 * 1000 / FRAME_MS):
-                break
-
-    return write_wav_file(frames)
-
-
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 def main() -> None:
-    # openWakeWord model, you can load custom wake word models later.
-    # For now, we’ll use built-in keyword spotting by scoring text-like labels.
-    model = Model()  # default pretrained
+    porcupine = build_porcupine()
 
     pa = pyaudio.PyAudio()
     stream = pa.open(
+        rate=porcupine.sample_rate,
+        channels=1,
         format=pyaudio.paInt16,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
         input=True,
-        frames_per_buffer=FRAME_SAMPLES,
+        frames_per_buffer=porcupine.frame_length,
     )
 
     try:
         while True:
-            # 1) Listen for wake word
-            frame = stream.read(FRAME_SAMPLES, exception_on_overflow=False)
+            # 1) Listen for wake
+            pcm_bytes = stream.read(porcupine.frame_length, exception_on_overflow=False)
+            pcm = struct.unpack_from("h" * porcupine.frame_length, pcm_bytes)
 
-            # openWakeWord expects numpy int16 frames
-            import numpy as np
-            audio_i16 = np.frombuffer(frame, dtype=np.int16)
-
-            preds = model.predict(audio_i16)
-
-            # preds is a dict of keyword->score depending on model config
-            # We'll do a simple heuristic: if any known name appears as a key and score high
-            triggered = False
-            triggered_key = None
-
-            for key, score in preds.items():
-                k = str(key).lower()
-                if any(name in k for name in WAKE_NAMES) and score >= 0.60:
-                    triggered = True
-                    triggered_key = k
-                    break
-
-            if not triggered:
+            keyword_index = porcupine.process(pcm)
+            if keyword_index < 0:
                 continue
 
             # 2) Wake detected
@@ -213,9 +243,12 @@ def main() -> None:
             play_local_wav(FALLBACK_WAV)
 
     finally:
-        stream.stop_stream()
-        stream.close()
-        pa.terminate()
+        try:
+            stream.stop_stream()
+            stream.close()
+        finally:
+            pa.terminate()
+            porcupine.delete()
 
 
 if __name__ == "__main__":

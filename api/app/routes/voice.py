@@ -67,6 +67,7 @@ async def create_dev_voice_interaction(
     )
     db.add(interaction)
     await db.flush()
+    trace_id = uuid.uuid4().hex
 
     # Enqueue job (same as real voice path)
     await enqueue(db, "PROCESS_VOICE_INTERACTION", {
@@ -74,6 +75,7 @@ async def create_dev_voice_interaction(
         "user_id": str(user.id),
         "conversation_id": str(conversation.id),
         "dev_mode": True,  # optional flag (worker can ignore)
+        "trace_id":trace_id
     })
 
     await log_event(db, "dev_voice_interaction_created", "info", source="api", metadata={
