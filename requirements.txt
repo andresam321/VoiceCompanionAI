@@ -12,23 +12,28 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 
 openai==1.51.0
-
 httpx==0.27.2
 aiofiles==24.1.0
-
 python-multipart==0.0.9
 
 structlog==24.4.0
+tenacity==9.0.0
 
 numpy==2.1.1
 scipy==1.14.1
 
 sounddevice==0.4.7
-# pyaudio==0.2.14
-soundfile
+soundfile==0.13.1
 
-tenacity==9.0.0
+requests==2.32.3
+watchfiles==0.24.0
+
+pyaudio
+pvporcupine
+webrtcvad
+
+# Fix for webrtcvad importing pkg_resources
+setuptools<82
 
 pytest==8.3.3
 pytest-asyncio==0.24.0
-watchfiles>=0.21.0

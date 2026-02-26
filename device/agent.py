@@ -23,9 +23,10 @@ DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "dev-device-token-001")
 HEADERS_BASE = {"X-Device-Token": DEVICE_TOKEN}
 
 # Porcupine
-PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY", "")
+PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
 PAL_KEYWORD_PATH = os.getenv("PAL_KEYWORD_PATH", "")  # e.g. device/keywords/pal.ppn
 FALLBACK_KEYWORD = os.getenv("FALLBACK_KEYWORD", "porcupine")  # built-in keyword
+PORCUPINE_SENSITIVITY = float(os.getenv("PORCUPINE_SENSITIVITY", "0.6"))
 
 # Audio
 SAMPLE_RATE = 16000
@@ -33,6 +34,10 @@ CHANNELS = 1
 FRAME_MS = 20
 FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 320 @ 16kHz
 HTTP_TIMEOUT = 10
+
+# Optional audio device selection (Mac often needs this)
+AUDIO_INPUT_DEVICE_INDEX = os.getenv("AUDIO_INPUT_DEVICE_INDEX")  # e.g. "0", "1"
+PRINT_AUDIO_DEVICES = os.getenv("PRINT_AUDIO_DEVICES", "false").lower() == "true"
 
 # Polling
 POLL_INTERVAL = 0.6
@@ -178,15 +183,25 @@ def build_porcupine() -> pvporcupine.Porcupine:
         return pvporcupine.create(
             access_key=PICOVOICE_ACCESS_KEY,
             keyword_paths=[str(keyword_path)],
-            sensitivities=[0.6],
+            sensitivities=[PORCUPINE_SENSITIVITY],
         )
 
-    # fallback built-in keyword
     return pvporcupine.create(
         access_key=PICOVOICE_ACCESS_KEY,
         keywords=[FALLBACK_KEYWORD],
-        sensitivities=[0.6],
+        sensitivities=[PORCUPINE_SENSITIVITY],
     )
+
+
+def print_input_devices(pa: pyaudio.PyAudio) -> None:
+    print("\n--- Audio Input Devices ---")
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if int(info.get("maxInputChannels", 0)) > 0:
+            name = info.get("name", "")
+            rate = info.get("defaultSampleRate", "")
+            print(f"[{i}] {name} (defaultSampleRate={rate})")
+    print("---------------------------\n")
 
 
 # -----------------------------------------------------------------------------
@@ -196,13 +211,23 @@ def main() -> None:
     porcupine = build_porcupine()
 
     pa = pyaudio.PyAudio()
+    if PRINT_AUDIO_DEVICES:
+        print_input_devices(pa)
+
+    input_device_index = int(AUDIO_INPUT_DEVICE_INDEX) if AUDIO_INPUT_DEVICE_INDEX else None
+
     stream = pa.open(
-        rate=porcupine.sample_rate,
+        rate=porcupine.sample_rate,  # Porcupine expects its sample rate
         channels=1,
         format=pyaudio.paInt16,
         input=True,
+        input_device_index=input_device_index,
         frames_per_buffer=porcupine.frame_length,
     )
+
+    print(f"Listening, API_BASE={API_BASE}, keyword={'PAL' if PAL_KEYWORD_PATH else FALLBACK_KEYWORD}")
+    if input_device_index is not None:
+        print(f"Using AUDIO_INPUT_DEVICE_INDEX={input_device_index}")
 
     try:
         while True:
