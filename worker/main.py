@@ -70,20 +70,14 @@ async def run_loop() -> None:
 
                 except Exception as exc:
                     tb = traceback.format_exc()
-                    await fail_job(db, job.id, f"{exc}\n{tb}")
-                    await log_event(db, "job_failed", "error", source="worker", metadata={
-                        "job_id": job_id,
-                        "job_type": job_type,
-                        "error": str(exc),
-                    })
-                    await db.rollback()  # ❌ revert partial writes
 
-                    await fail_job(
-                        db,
-                        job.id,
-                        f"{exc}\n{tb}",
-                    )
+                    # Revert any partial writes from the handler
+                    await db.rollback()
 
+                    # Mark job failed / schedule retry
+                    await fail_job(db, job, f"{exc}\n{tb}")
+
+                    # Log failure event (optional but good)
                     await log_event(
                         db,
                         "job_failed",
@@ -96,7 +90,8 @@ async def run_loop() -> None:
                         },
                     )
 
-                    await db.commit()  # persist failure record
+                    # Persist failure record + event
+                    await db.commit()
 
         except Exception as exc:
             logger.exception("Worker loop error: %s", exc)

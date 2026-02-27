@@ -56,15 +56,21 @@ def is_affirmative(text: str) -> bool:
         "do it", "yes please", "ok please"
     }
 
-def is_negative(text: str) -> bool:
+def is_cancel(text: str) -> bool:
     t = (text or "").strip().lower()
-    if t.startswith((
-        "no i mean", "no, i mean",
-        "no its", "no it's",
-        "no about", "no just"
-    )):
+    if not t:
         return False
-    return t in {"no", "n", "nope", "nah", "different", "another"}
+    return any(p in t for p in (
+        "cancel", "stop", "exit", "quit",
+        "never mind", "nevermind",
+        "no story", "not a story",
+        "dont tell a story", "don't tell a story",
+        "don't want a story", "dont want a story",
+    ))
+
+def is_plain_no(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"no", "nope", "nah", "n"}
 
 def extract_theme_correction(text: str) -> str | None:
     raw = (text or "").strip()
@@ -72,17 +78,20 @@ def extract_theme_correction(text: str) -> str | None:
     if not t:
         return None
 
+    # "no, about dinosaurs"
     m = re.match(r"^no\b.*?\babout\b\s+(.+)$", t)
     if m:
         parts = re.split(r"\babout\b", raw, flags=re.IGNORECASE, maxsplit=1)
         remainder = parts[1].strip() if len(parts) > 1 else ""
         return remainder[:64] if remainder else None
 
+    # "no i want dinosaurs", "actually dinosaurs"
     starters = (
         "no i mean", "no, i mean",
         "actually", "wait", "umm no", "uh no",
         "no it's", "no its", "no just",
         "no i want", "no i wan", "no i wnat",
+        "i want", "about",
     )
     for s in starters:
         if t.startswith(s):
@@ -134,7 +143,11 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
         out_path = Path(interaction.audio_output_path)
         if out_path.exists():
             logger.info("trace=%s idempotent hit, already complete", trace_id)
-            return {"interaction_id": str(interaction_id), "latency_ms": interaction.latency_ms or 0, "idempotent": True}
+            return {
+                "interaction_id": str(interaction_id),
+                "latency_ms": interaction.latency_ms or 0,
+                "idempotent": True,
+            }
 
     # mark processing
     interaction.status = "processing"
@@ -164,11 +177,9 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
     # ── Routing setup ───────────────────────────
     goto_llm = True
     assistant_reply: str | None = None
+
     bot_profile = (
-    await db.execute(
-        select(BotProfile)
-        .where(BotProfile.user_id == user_id)
-        )
+        await db.execute(select(BotProfile).where(BotProfile.user_id == user_id))
     ).scalar_one_or_none()
     bot_name = bot_profile.name if bot_profile and bot_profile.name else "Buddy"
 
@@ -186,13 +197,26 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
         slots: dict[str, Any] = conversation.pending_slots or {}
         text = transcript.strip()
 
-        if slots.get("awaiting_confirmation"):
+        # Allow explicit cancel at any point in story flow
+        if is_cancel(text):
+            conversation.pending_intent = None
+            conversation.pending_slots = None
+            await checkpoint()
+
+            assistant_reply = "Okay 😊 No story. What do you want to do instead?"
+            goto_llm = False
+
+        elif slots.get("awaiting_confirmation"):
+            # loop breaker counter
+            slots.setdefault("no_count", 0)
+
             correction = extract_theme_correction(text)
 
             if correction:
                 merged = dict(slots)
                 merged["theme"] = correction[:64]
                 merged["awaiting_confirmation"] = True
+                merged["no_count"] = 0
                 conversation.pending_slots = merged
                 await checkpoint()
 
@@ -217,19 +241,35 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
                 system_prompt = "You are a warm bedtime storyteller for children."
                 goto_llm = True
 
-            elif is_negative(text):
-                conversation.pending_slots = {"awaiting_confirmation": False}
-                await checkpoint()
+            elif is_plain_no(text):
+                merged = dict(slots)
+                merged["no_count"] = int(merged.get("no_count", 0)) + 1
 
-                assistant_reply = "Okay 😊 What should the bedtime story be about instead?"
-                goto_llm = False
+                if merged["no_count"] >= 2:
+                    # Second plain "no" -> exit story mode
+                    conversation.pending_intent = None
+                    conversation.pending_slots = None
+                    await checkpoint()
+
+                    assistant_reply = "Okay 😊 We can stop. What do you want to do next?"
+                    goto_llm = False
+                else:
+                    # First plain "no" -> revise theme (ask for a new topic)
+                    merged["awaiting_confirmation"] = False
+                    conversation.pending_slots = merged
+                    await checkpoint()
+
+                    assistant_reply = "Okay 😊 What should the bedtime story be about instead?"
+                    goto_llm = False
 
             else:
+                # If kid says a short topic, treat it as new theme and reconfirm
                 if looks_like_story_topic(text):
                     new_slots = extract_story_slots(text)
                     merged = {**slots, **new_slots}
                     merged = normalize_or_fallback_theme(text, merged)
                     merged["awaiting_confirmation"] = True
+                    merged["no_count"] = 0
                     conversation.pending_slots = merged
                     await checkpoint()
 
@@ -240,6 +280,7 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
                     goto_llm = False
 
         else:
+            # awaiting_confirmation is False -> gather slots
             new_slots = extract_story_slots(text)
             merged = {**(slots or {}), **new_slots}
             merged = normalize_or_fallback_theme(text, merged)
@@ -251,6 +292,7 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
                 goto_llm = False
             else:
                 merged["awaiting_confirmation"] = True
+                merged.setdefault("no_count", 0)
                 conversation.pending_slots = merged
                 await checkpoint()
                 assistant_reply = build_story_confirmation_question(merged["theme"])
@@ -271,6 +313,7 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
                     slots = normalize_or_fallback_theme(transcript, slots)
 
             slots["awaiting_confirmation"] = True
+            slots["no_count"] = 0
             conversation.pending_intent = STORY_INTENT
             conversation.pending_slots = slots
             await checkpoint()
@@ -281,11 +324,6 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
     # ==========================================================
     # LLM (idempotent + fallback)
     # ==========================================================
-    # Idempotency: if we already generated assistant reply earlier, skip LLM
-    if interaction.assistant_reply and interaction.assistant_reply.strip():
-        assistant_reply = interaction.assistant_reply.strip()
-        goto_llm = False
-
     if goto_llm:
         try:
             await checkpoint()
@@ -311,18 +349,12 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
             audio_out = existing
 
     if not audio_out.exists():
-
-        voice = (
-            bot_profile.voice
-            if bot_profile and bot_profile.voice
-            else settings.openai_tts_voice
-        )
+        voice = bot_profile.voice if bot_profile and bot_profile.voice else settings.openai_tts_voice
 
         try:
             await checkpoint()
             await synthesize_speech(assistant_reply, audio_out, voice=voice)
         except Exception as exc:
-            # Do NOT brick the interaction for a kid, keep text reply
             logger.error("trace=%s tts failed: %s", trace_id, exc)
 
     interaction.audio_output_path = str(audio_out)
