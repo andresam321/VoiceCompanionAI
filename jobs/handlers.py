@@ -31,7 +31,7 @@ from services.memory_service import retrieve_relevant_memories
 from services.openai_llm import chat_completion
 from services.openai_stt import transcribe_audio
 from services.openai_tts import synthesize_speech
-
+from services.memory_service import retrieve_relevant_memories, extract_memories, store_memory
 from ai.intents.story import (
     STORY_INTENT,
     detect_bedtime_story_request,
@@ -50,11 +50,27 @@ logger = logging.getLogger(__name__)
 
 def is_affirmative(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {
-        "yes", "y", "yeah", "yep", "yup",
-        "ok", "okay", "sure", "please",
-        "do it", "yes please", "ok please"
-    }
+    if not t:
+        return False
+
+    # exact quick matches
+    if t in {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay"}:
+        return True
+
+    # prefix matches for natural speech
+    return (
+        t.startswith("yes")
+        or t.startswith("yeah")
+        or t.startswith("yep")
+        or t.startswith("yup")
+        or t.startswith("sure")
+        or t.startswith("ok")
+        or t.startswith("okay")
+        or "let's do it" in t
+        or "do it" in t
+        or "go ahead" in t
+        or "start" in t
+    )
 
 def is_cancel(text: str) -> bool:
     t = (text or "").strip().lower()
@@ -70,7 +86,10 @@ def is_cancel(text: str) -> bool:
 
 def is_plain_no(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"no", "nope", "nah", "n"}
+    if t in {"no", "nope", "nah", "n"}:
+        return True
+    # treat "no ..." as a no (unless it's a correction like "no, about dinosaurs")
+    return t.startswith("no ") or t.startswith("no,")
 
 def extract_theme_correction(text: str) -> str | None:
     raw = (text or "").strip()
@@ -78,25 +97,21 @@ def extract_theme_correction(text: str) -> str | None:
     if not t:
         return None
 
-    # "no, about dinosaurs"
+    # common "no, about X" or "no about X"
     m = re.match(r"^no\b.*?\babout\b\s+(.+)$", t)
     if m:
-        parts = re.split(r"\babout\b", raw, flags=re.IGNORECASE, maxsplit=1)
-        remainder = parts[1].strip() if len(parts) > 1 else ""
-        return remainder[:64] if remainder else None
+        return m.group(1).strip()[:64] or None
 
-    # "no i want dinosaurs", "actually dinosaurs"
-    starters = (
-        "no i mean", "no, i mean",
-        "actually", "wait", "umm no", "uh no",
-        "no it's", "no its", "no just",
-        "no i want", "no i wan", "no i wnat",
-        "i want", "about",
-    )
-    for s in starters:
-        if t.startswith(s):
-            remainder = raw[len(s):].strip()
-            return remainder[:64] if remainder else None
+    # "no i want X", "no i want it to be X", "no make it X"
+    m = re.match(r"^no\b[\s,]*?(?:i\s+want|i\s+want\s+it\s+to\s+be|make\s+it|do\s+it|let's\s+do)\s+(.+)$", t)
+    if m:
+        return m.group(1).strip()[:64] or None
+
+    # "actually X", "wait X"
+    m = re.match(r"^(?:actually|wait)[\s,]+(.+)$", t)
+    if m:
+        return m.group(1).strip()[:64] or None
+
     return None
 
 def looks_like_story_topic(text: str) -> bool:
@@ -107,6 +122,32 @@ def looks_like_story_topic(text: str) -> bool:
         return False
     return len(t.split()) <= 8
 
+
+async def build_conversation_history(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    interaction_id: uuid.UUID,
+    limit: int = 12,
+) -> list[dict]:
+    stmt = (
+        select(Interaction)
+        .where(
+            Interaction.conversation_id == conversation_id,
+            Interaction.id != interaction_id,  # don’t include current turn
+        )
+        .order_by(Interaction.created_at.desc())
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    rows = list(reversed(rows))  # chronological
+
+    history: list[dict] = []
+    for it in rows:
+        if it.transcript and it.transcript.strip():
+            history.append({"role": "user", "content": it.transcript.strip()})
+        if it.assistant_reply and it.assistant_reply.strip():
+            history.append({"role": "assistant", "content": it.assistant_reply.strip()})
+    return history
 
 async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> dict:
     settings = get_settings()
@@ -251,7 +292,7 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
                     conversation.pending_slots = None
                     await checkpoint()
 
-                    assistant_reply = "Okay 😊 We can stop. What do you want to do next?"
+                    assistant_reply = "Okay We can stop. What do you want to do next?"
                     goto_llm = False
                 else:
                     # First plain "no" -> revise theme (ask for a new topic)
@@ -259,7 +300,7 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
                     conversation.pending_slots = merged
                     await checkpoint()
 
-                    assistant_reply = "Okay 😊 What should the bedtime story be about instead?"
+                    assistant_reply = "Okay What should the bedtime story be about instead?"
                     goto_llm = False
 
             else:
@@ -327,16 +368,82 @@ async def handle_process_voice_interaction(db: AsyncSession, payload: dict) -> d
     if goto_llm:
         try:
             await checkpoint()
-            assistant_reply = await chat_completion(system_prompt, transcript)
+
+            # short-term context (last turns)
+            history = await build_conversation_history(
+                db=db,
+                conversation_id=conversation.id,
+                interaction_id=interaction.id,
+                limit=12,
+            )
+
+            # long-term context (personalization)
+            mems = await retrieve_relevant_memories(
+                db,
+                user_id,
+                transcript,
+                limit=5,
+            )
+
+            if mems:
+                memory_block = "Helpful facts about the child:\n" + "\n".join(
+                    f"- {m.content}" for m in mems
+                )
+                conversation_history = [{"role": "system", "content": memory_block}] + history
+            else:
+                conversation_history = history
+
+            assistant_reply = await chat_completion(
+                system_prompt=system_prompt,
+                user_message=transcript,
+                conversation_history=conversation_history,
+            )
+
         except Exception as exc:
             logger.error("trace=%s llm failed: %s", trace_id, exc)
             assistant_reply = "Hmm, I’m thinking really hard 😊 Can you tell me again?"
 
     if not assistant_reply:
-        assistant_reply = "Okay 😊 What should we do next?"
+        assistant_reply = "Okay What should we do next?"
 
     interaction.assistant_reply = assistant_reply
-    await checkpoint()
+    # await checkpoint()
+    # ── Long-term memory write (best-effort) ───────
+    try:
+        await checkpoint()  # end any open transaction before network calls
+
+        memories = await extract_memories(
+            transcript=transcript,
+            assistant_reply=assistant_reply,
+            detected_emotion=getattr(interaction, "detected_emotion", None),
+        )
+
+        for m in memories:
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+
+            salience = float(m.get("salience", 0.5) or 0.5)
+
+            # guardrails to avoid memory pollution
+            if salience < 0.6:
+                continue
+            if len(content) < 6:
+                continue
+
+            await store_memory(
+                db=db,
+                user_id=user_id,
+                interaction_id=interaction.id,
+                content=content[:500],  # keep it compact
+                category=m.get("category") or "general",
+                emotional_context=m.get("emotional_context"),
+                salience_score=salience,
+            )
+
+        await checkpoint()
+    except Exception as exc:
+        logger.warning("trace=%s memory write skipped: %s", trace_id, exc)
 
     # ── TTS (idempotent + best-effort) ──────────
     settings.audio_dir.mkdir(parents=True, exist_ok=True)

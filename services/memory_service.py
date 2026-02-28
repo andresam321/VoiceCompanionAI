@@ -37,6 +37,24 @@ Respond with JSON:
 If there is nothing worth remembering, return {"memories": []}.
 """
 
+def rule_based_memory_candidates(text: str) -> list[str]:
+    t = text.lower().strip()
+    memories = []
+
+    if t.startswith("i like "):
+        memories.append(f"Likes {text[7:].strip()}")
+    elif t.startswith("i love "):
+        memories.append(f"Loves {text[7:].strip()}")
+    elif t.startswith("my favorite"):
+        memories.append(text.strip())
+    elif t.startswith("i don't like") or t.startswith("i dont like"):
+        memories.append(text.strip())
+    elif "my dog's name is" in t or "my dog is named" in t:
+        memories.append(text.strip())
+    elif t.startswith("i am scared of") or "i'm scared of" in t:
+        memories.append(text.strip())
+
+    return memories
 
 async def extract_memories(
     transcript: str,
